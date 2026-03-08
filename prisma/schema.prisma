@@ -1,0 +1,593 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  Scrutix — Election Tracking & Prediction Platform             ║
+// ║  Prisma Schema v2.0                                            ║
+// ║                                                                ║
+// ║  9 core domain models + User/social models                     ║
+// ║  All models include: createdAt, updatedAt, isDeleted           ║
+// ║  All relations are explicit with onDelete strategies           ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  ENUMS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Seçim türü — her seçim kaydı bu türlerden birine sahiptir.
+enum ElectionType {
+  PRESIDENTIAL  // Cumhurbaşkanlığı seçimi
+  PARLIAMENTARY // Milletvekili genel seçimi
+  LOCAL         // Yerel yönetim seçimi (il genel meclisi, belediye meclisi)
+  MUNICIPAL     // Büyükşehir / ilçe belediye başkanlığı
+  REFERENDUM    // Halk oylaması
+  BY_ELECTION   // Ara seçim (boşalan sandalye)
+}
+
+/// Seçim durumu — yaşam döngüsünü takip eder.
+enum ElectionStatus {
+  UPCOMING   // Henüz gerçekleşmedi
+  ACTIVE     // Oy verme süreci devam ediyor
+  COUNTING   // Sandıklar kapandı, sayım yapılıyor
+  COMPLETED  // Resmi sonuçlar ilan edildi
+  CANCELLED  // İptal / ertelendi
+}
+
+/// Bölge hiyerarşi türü — harita katmanlarını belirler.
+enum RegionType {
+  COUNTRY      // Ülke düzeyinde
+  PROVINCE     // İl
+  DISTRICT     // İlçe
+  NEIGHBORHOOD // Mahalle / belde
+  CONSTITUENCY // Seçim çevresi (milletvekili dağılımı)
+  ABROAD       // Yurt dışı temsilcilik bölgesi
+}
+
+/// Veri kaynağı doğrulama durumu.
+enum VerificationStatus {
+  PENDING   // Henüz doğrulanmadı
+  VERIFIED  // Editör onayladı
+  REJECTED  // Tutarsız / güvenilmez olarak işaretlendi
+  STALE     // Güncelliğini yitirdi
+}
+
+/// Tahmin durumu — yayınlanma ve sonuçlanma akışı.
+enum PredictionStatus {
+  DRAFT      // Taslak, henüz yayınlanmadı
+  PUBLISHED  // Yayında, seçim sonuçlanmadı
+  SETTLED    // Seçim sonuçlandı, sapma hesaplandı
+  ARCHIVED   // Arşivlendi
+}
+
+/// Kullanıcı rolleri.
+enum UserRole {
+  USER    // Standart kullanıcı
+  ANALYST // İleri analiz araçlarına erişim
+  EDITOR  // İçerik düzenleme yetkisi
+  ADMIN   // Tam yönetim
+}
+
+/// Kullanıcı aktivite türleri — audit log için.
+enum ActivityType {
+  PREDICTION_CREATED
+  PREDICTION_UPDATED
+  COMMENT_POSTED
+  BOOKMARK_ADDED
+  BOOKMARK_REMOVED
+  DATA_SOURCE_ADDED
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  1. ELECTION — Seçim kaydı
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Her seçim bir ülkeye ve opsiyonel bir bölgeye aittir.
+/// Tür (cumhurbaşkanlığı, milletvekili vb.) ve durum enum ile yönetilir.
+/// Bir seçime bağlı adaylar, partiler, anketler, tahminler ve geçmiş sonuçlar vardır.
+model Election {
+  id          String         @id @default(cuid())
+  title       String         @db.VarChar(300)
+  slug        String         @unique @db.VarChar(300)
+  description String?        @db.Text
+  type        ElectionType
+  status      ElectionStatus @default(UPCOMING)
+  country     String         @db.VarChar(100)
+  date        DateTime       @db.Date
+  round       Int            @default(1)                 // 1. tur, 2. tur vb.
+  turnout     Float?                                     // Katılım oranı (%)
+  coverImage  String?        @map("cover_image")
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── İlişkiler ──
+  regionId String? @map("region_id")
+  region   Region? @relation(fields: [regionId], references: [id], onDelete: SetNull)
+
+  candidates        Candidate[]
+  electionParties   ElectionParty[]
+  pollResults       PollResult[]
+  historicalResults HistoricalResult[]
+  predictions       Prediction[]
+  dataSources       DataSource[]
+  comments          Comment[]
+  bookmarks         Bookmark[]
+  timelineEvents    TimelineEvent[]
+
+  @@index([status])
+  @@index([type])
+  @@index([date])
+  @@index([country])
+  @@index([regionId])
+  @@index([isDeleted])
+  @@index([country, type, date])
+  @@map("elections")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  2. PARTY — Siyasi parti
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Ülke bazlı siyasi parti kaydı.
+/// color alanı grafiklerde tutarlı renk eşlemesi sağlar (hex: #RRGGBB).
+/// logoUrl parti amblemini taşır.
+/// Bir parti birden fazla seçime katılabilir (ElectionParty pivot).
+model Party {
+  id           String  @id @default(cuid())
+  name         String  @db.VarChar(250)
+  abbreviation String  @db.VarChar(20)
+  slug         String  @unique @db.VarChar(100)
+  country      String  @db.VarChar(100)
+  logoUrl      String? @map("logo_url")
+  color        String  @db.VarChar(7)                   // #RRGGBB hex
+  website      String?
+  description  String? @db.Text
+  ideology     String? @db.VarChar(200)
+  founded      Int?                                     // Kuruluş yılı
+  leaderName   String? @map("leader_name") @db.VarChar(200)
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── İlişkiler ──
+  candidates        Candidate[]
+  electionParties   ElectionParty[]
+  pollResults       PollResult[]
+  historicalResults HistoricalResult[]
+  predictions       Prediction[]
+
+  @@index([country])
+  @@index([abbreviation])
+  @@index([isDeleted])
+  @@map("parties")
+}
+
+/// Seçim ↔ Parti çoka-çok pivot tablosu.
+/// alliance alanı koalisyon / ittifak bloğunu gösterir.
+model ElectionParty {
+  id         String  @id @default(cuid())
+  electionId String  @map("election_id")
+  partyId    String  @map("party_id")
+  alliance   String? @db.VarChar(200)                   // "Cumhur İttifakı", "Millet İttifakı" vb.
+  listOrder  Int?    @map("list_order")                 // Oy pusulası sırası
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  party    Party    @relation(fields: [partyId], references: [id], onDelete: Cascade)
+
+  @@unique([electionId, partyId])
+  @@index([electionId])
+  @@index([partyId])
+  @@map("election_parties")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  3. CANDIDATE — Aday
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Bir seçimdeki aday kaydı.
+/// Partiye opsiyonel bağlıdır (bağımsız aday olabilir).
+/// isIncumbent mevcut görevde olup olmadığını gösterir.
+/// Aday birden fazla seçimde yer alabilir (farklı Candidate kayıtları).
+model Candidate {
+  id          String  @id @default(cuid())
+  name        String  @db.VarChar(250)
+  slug        String  @unique @db.VarChar(250)
+  photoUrl    String? @map("photo_url")
+  biography   String? @db.Text
+  isIncumbent Boolean @default(false) @map("is_incumbent")
+  number      Int?                                      // Oy pusulası sıra numarası
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  electionId String  @map("election_id")
+  partyId    String? @map("party_id")
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  party    Party?   @relation(fields: [partyId], references: [id], onDelete: SetNull)
+
+  // ── Ters ilişkiler ──
+  pollResults       PollResult[]
+  historicalResults HistoricalResult[]
+  predictions       Prediction[]
+
+  @@index([electionId])
+  @@index([partyId])
+  @@index([isDeleted])
+  @@index([electionId, partyId])
+  @@map("candidates")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  4. POLL RESULT — Anket sonucu
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Bir anket şirketinin belirli bir seçim için yayınladığı anket sonucu.
+/// Her satır tek bir parti/aday için oy oranını tutar.
+/// reliabilityScore, şirketin geçmiş isabetine göre ağırlıklandırma yapmayı sağlar.
+/// Aynı anketin birden fazla satırı olur (her parti/aday için bir tane).
+model PollResult {
+  id               String   @id @default(cuid())
+  percentage       Float                                // Oy oranı tahmin (%)
+  sampleSize       Int?     @map("sample_size")         // Örneklem büyüklüğü
+  marginOfError    Float?   @map("margin_of_error")     // ± hata payı (%)
+  methodology      String?  @db.VarChar(300)            // CATI, CAPI, Online vb.
+  fieldworkStart   DateTime? @map("fieldwork_start")
+  fieldworkEnd     DateTime? @map("fieldwork_end")
+  publishedAt      DateTime @map("published_at")
+  reliabilityScore Float?   @map("reliability_score")   // 0.0–1.0 güvenilirlik skoru
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  electionId  String  @map("election_id")
+  partyId     String? @map("party_id")
+  candidateId String? @map("candidate_id")
+  pollFirmId  String  @map("poll_firm_id")
+  dataSourceId String? @map("data_source_id")
+
+  election   Election    @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  party      Party?      @relation(fields: [partyId], references: [id], onDelete: SetNull)
+  candidate  Candidate?  @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  pollFirm   PollFirm    @relation(fields: [pollFirmId], references: [id], onDelete: Restrict)
+  dataSource DataSource? @relation(fields: [dataSourceId], references: [id], onDelete: SetNull)
+
+  @@index([electionId])
+  @@index([pollFirmId])
+  @@index([partyId])
+  @@index([candidateId])
+  @@index([publishedAt])
+  @@index([isDeleted])
+  @@index([electionId, publishedAt])
+  @@index([electionId, partyId, publishedAt])
+  @@map("poll_results")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  5. POLL FIRM — Anket şirketi
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Anket / araştırma şirketi kaydı.
+/// accuracyScore geçmiş seçimlerdeki ortalama sapma ile hesaplanır.
+/// Düşük sapma = yüksek accuracyScore → anket sonuçları daha yüksek ağırlık alır.
+model PollFirm {
+  id            String  @id @default(cuid())
+  name          String  @db.VarChar(250)
+  slug          String  @unique @db.VarChar(200)
+  website       String?
+  country       String  @db.VarChar(100)
+  description   String? @db.Text
+  methodology   String? @db.VarChar(500)                // Genel metodoloji açıklaması
+  accuracyScore Float?  @map("accuracy_score")          // 0.0–100.0 geçmiş doğruluk puanı
+  totalPolls    Int     @default(0) @map("total_polls")  // Toplam yayınlanan anket sayısı
+  avgBias       Float?  @map("avg_bias")                 // Ortalama sapma yönü (+ sağ, - sol)
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── İlişkiler ──
+  pollResults PollResult[]
+
+  @@index([country])
+  @@index([accuracyScore])
+  @@index([isDeleted])
+  @@map("poll_firms")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  6. HISTORICAL RESULT — Geçmiş seçim sonucu
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Resmi seçim sonuçlarını bölge bazında saklar.
+/// voteCount + percentage ile hem mutlak hem oransal veri tutulur.
+/// Tahmin modellerinin doğruluğunu ölçmek ve geçmiş trend analizi için kullanılır.
+/// registeredVoters + turnout ile katılım oranı bölge bazında izlenir.
+model HistoricalResult {
+  id               String  @id @default(cuid())
+  voteCount        Int     @map("vote_count")            // Alınan toplam oy
+  percentage       Float                                  // Oy oranı (%)
+  seatCount        Int?    @map("seat_count")             // Kazanılan sandalye (parlamento)
+  registeredVoters Int?    @map("registered_voters")      // Kayıtlı seçmen sayısı
+  turnout          Float?                                 // Katılım oranı (%)
+  isOfficial       Boolean @default(false) @map("is_official") // YSK onaylı mı?
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  electionId  String  @map("election_id")
+  partyId     String? @map("party_id")
+  candidateId String? @map("candidate_id")
+  regionId    String? @map("region_id")
+
+  election  Election   @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  party     Party?     @relation(fields: [partyId], references: [id], onDelete: SetNull)
+  candidate Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  region    Region?    @relation(fields: [regionId], references: [id], onDelete: SetNull)
+
+  @@index([electionId])
+  @@index([partyId])
+  @@index([candidateId])
+  @@index([regionId])
+  @@index([isDeleted])
+  @@index([electionId, regionId])
+  @@index([electionId, partyId, regionId])
+  @@map("historical_results")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  7. REGION — Bölge / İl
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Coğrafi bölge hiyerarşisi (ülke > il > ilçe > mahalle > seçim çevresi).
+/// Self-referencing parent/children ile ağaç yapısı.
+/// geoJson alanı harita görselleştirmesi için GeoJSON formatında sınır verisini tutar.
+/// population ve registeredVoters demografik analiz için kullanılır.
+model Region {
+  id               String     @id @default(cuid())
+  name             String     @db.VarChar(200)
+  code             String     @unique @db.VarChar(20)    // TR-34, TR-06 gibi ISO veya özel kod
+  type             RegionType
+  country          String     @db.VarChar(100)
+  population       Int?
+  registeredVoters Int?       @map("registered_voters")
+  geoJson          Json?      @map("geo_json")           // GeoJSON Feature objesi
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── Self-referencing hiyerarşi ──
+  parentId String?  @map("parent_id")
+  parent   Region?  @relation("RegionHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children Region[] @relation("RegionHierarchy")
+
+  // ── Ters ilişkiler ──
+  elections         Election[]
+  historicalResults HistoricalResult[]
+  predictions       Prediction[]
+
+  @@index([type])
+  @@index([country])
+  @@index([parentId])
+  @@index([isDeleted])
+  @@index([country, type])
+  @@map("regions")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  8. PREDICTION — Platform tahmini
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Scrutix platformunun veya analistlerin ürettiği seçim tahmini.
+/// low/mid/high üçlüsü güven aralığı (confidence interval) sağlar:
+///   - low:  %5 alt sınır (pessimist senaryo)
+///   - mid:  en olası değer (median/mode)
+///   - high: %95 üst sınır (optimist senaryo)
+/// Seçim sonuçlandığında actualResult ve deviation otomatik hesaplanır.
+/// Parti veya aday bazında bölge düzeyinde tahmin yapılabilir.
+model Prediction {
+  id           String           @id @default(cuid())
+  low          Float                                     // Alt sınır tahmini (%)
+  mid          Float                                     // En olası tahmin (%)
+  high         Float                                     // Üst sınır tahmini (%)
+  confidence   Float?                                    // Güven düzeyi (0.0–1.0)
+  reasoning    String?          @db.Text                 // Tahmin gerekçesi
+  status       PredictionStatus @default(DRAFT)
+  actualResult Float?           @map("actual_result")    // Gerçekleşen sonuç (%)
+  deviation    Float?                                    // |mid - actual| sapma
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  electionId  String  @map("election_id")
+  partyId     String? @map("party_id")
+  candidateId String? @map("candidate_id")
+  regionId    String? @map("region_id")
+  userId      String? @map("user_id")                    // null → sistem tahmini
+
+  election  Election   @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  party     Party?     @relation(fields: [partyId], references: [id], onDelete: SetNull)
+  candidate Candidate? @relation(fields: [candidateId], references: [id], onDelete: SetNull)
+  region    Region?    @relation(fields: [regionId], references: [id], onDelete: SetNull)
+  user      User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([electionId, partyId, candidateId, regionId, userId])
+  @@index([electionId])
+  @@index([partyId])
+  @@index([candidateId])
+  @@index([regionId])
+  @@index([userId])
+  @@index([status])
+  @@index([isDeleted])
+  @@index([electionId, status])
+  @@map("predictions")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  9. DATA SOURCE — Veri kaynağı log kaydı
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Sisteme giren her veri parçasının kaynağını ve doğrulama durumunu izler.
+/// URL, son çekilme tarihi, HTTP yanıt kodu ve checksum ile veri bütünlüğü sağlanır.
+/// Bir editör doğrulaması (verification) ile güvenilirlik kontrol edilir.
+model DataSource {
+  id               String             @id @default(cuid())
+  name             String             @db.VarChar(300)   // "KONDA Haziran 2028 Anketi" vb.
+  url              String?            @db.Text            // Kaynak URL
+  fetchedAt        DateTime?          @map("fetched_at")  // Son veri çekme zamanı
+  httpStatus       Int?               @map("http_status") // Son HTTP yanıt kodu
+  checksum         String?            @db.VarChar(128)    // SHA-256 içerik hash
+  verification     VerificationStatus @default(PENDING)
+  verifiedByUserId String?            @map("verified_by_user_id")
+  verifiedAt       DateTime?          @map("verified_at")
+  notes            String?            @db.Text            // Editör notları
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  electionId String? @map("election_id")
+
+  election   Election?    @relation(fields: [electionId], references: [id], onDelete: SetNull)
+  verifiedBy User?        @relation("DataSourceVerifier", fields: [verifiedByUserId], references: [id], onDelete: SetNull)
+
+  // ── Ters ilişkiler ──
+  pollResults PollResult[]
+
+  @@index([electionId])
+  @@index([verification])
+  @@index([fetchedAt])
+  @@index([isDeleted])
+  @@map("data_sources")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  USER — Kullanıcı
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// Platform kullanıcısı. Auth provider ile entegre edilir.
+/// Tahmin, yorum, yer imi ve veri doğrulama işlemleriyle ilişkilidir.
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?   @db.VarChar(200)
+  displayName   String?   @map("display_name") @db.VarChar(200)
+  avatarUrl     String?   @map("avatar_url")
+  role          UserRole  @default(USER)
+  isActive      Boolean   @default(true) @map("is_active")
+  emailVerified DateTime? @map("email_verified")
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── İlişkiler ──
+  predictions       Prediction[]
+  comments          Comment[]
+  bookmarks         Bookmark[]
+  activities        Activity[]
+  verifiedSources   DataSource[] @relation("DataSourceVerifier")
+
+  @@index([role])
+  @@index([isDeleted])
+  @@map("users")
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//  SOCIAL / ENGAGEMENT MODELS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Yorum — seçim sayfasında threaded tartışma.
+/// parentId ile sınırsız derinlikte yanıt ağacı desteklenir.
+model Comment {
+  id      String @id @default(cuid())
+  content String @db.Text
+
+  isDeleted Boolean  @default(false) @map("is_deleted")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // ── FK'ler ──
+  userId     String  @map("user_id")
+  electionId String  @map("election_id")
+  parentId   String? @map("parent_id")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  election Election  @relation(fields: [electionId], references: [id], onDelete: Cascade)
+  parent   Comment?  @relation("CommentThread", fields: [parentId], references: [id], onDelete: Cascade)
+  replies  Comment[] @relation("CommentThread")
+
+  @@index([electionId])
+  @@index([userId])
+  @@index([parentId])
+  @@index([isDeleted])
+  @@map("comments")
+}
+
+/// Yer imi — kullanıcının takip ettiği seçimler.
+model Bookmark {
+  id String @id @default(cuid())
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // ── FK'ler ──
+  userId     String @map("user_id")
+  electionId String @map("election_id")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, electionId])
+  @@map("bookmarks")
+}
+
+/// Seçim zaman çizelgesi — önemli olayların kaydı.
+model TimelineEvent {
+  id       String   @id @default(cuid())
+  title    String   @db.VarChar(300)
+  content  String?  @db.Text
+  date     DateTime
+  category String?  @db.VarChar(100)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // ── FK'ler ──
+  electionId String @map("election_id")
+
+  election Election @relation(fields: [electionId], references: [id], onDelete: Cascade)
+
+  @@index([electionId])
+  @@index([date])
+  @@map("timeline_events")
+}
+
+/// Aktivite logu — kullanıcı eylemlerinin audit trail'i.
+model Activity {
+  id   String       @id @default(cuid())
+  type ActivityType
+  meta Json?                                              // Ek bağlam verisi
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // ── FK'ler ──
+  userId String @map("user_id")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
+  @@map("activities")
+}
