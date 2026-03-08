@@ -46,6 +46,13 @@ jobs:
       - name: Install Vercel CLI
         run: npm install --global vercel@latest
 
+      - name: Debug Vercel Secrets
+        run: |
+          echo "Checking Secrets..."
+          echo "VERCEL_TOKEN is ${{ secrets.VERCEL_TOKEN != '' && 'SET' || 'EMPTY' }}"
+          echo "VERCEL_ORG_ID is ${{ secrets.VERCEL_ORG_ID != '' && 'SET' || 'EMPTY' }}"
+          echo "VERCEL_PROJECT_ID is ${{ secrets.VERCEL_PROJECT_ID != '' && 'SET' || 'EMPTY' }}"
+
       - name: Pull Vercel Environment Information
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
         env:
